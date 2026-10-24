@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0c1024" />
+    <meta
+      name="description"
+      content="Flapbound — a hand-crafted flappy bird-style game with skins, magnet power-ups, perfect-pass combos, goals, and synthesized sound."
+    />
+    <title>Flapbound</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23ffb457'/%3E%3Ccircle cx='41' cy='28' r='8' fill='%23fff'/%3E%3Ccircle cx='43' cy='29' r='4' fill='%2320243a'/%3E%3Cpath d='M49 34l12 2-11 6z' fill='%23ff9436'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="game" role="img" aria-label="Flapbound game"></canvas>
+
+      <div id="ui">
+        <!-- ============ HUD ============ -->
+        <header id="hud" class="hud" aria-live="polite">
+          <div class="hud-left">
+            <div class="coin-pill" id="coinPill" title="Coins">
+              <span class="coin-icon" aria-hidden="true"></span>
+              <span id="coinCount">0</span>
+            </div>
+          </div>
+          <div class="hud-center">
+            <div id="score" class="score">0</div>
+            <div id="combo" class="combo" hidden></div>
+          </div>
+          <div class="hud-right">
+            <button
+              class="icon-btn"
+              id="btnPause"
+              aria-label="Pause game"
+              title="Pause (P)"
+            >
+              <span class="pause-bars" aria-hidden="true"></span>
+            </button>
+          </div>
+          <div id="powerups" class="powerups"></div>
+        </header>
+
+        <!-- ============ MENU ============ -->
+        <section id="menu" class="screen screen-menu">
+          <div class="menu-inner">
+            <div class="brand">
+              <div class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 64 64" width="64" height="64">
+                  <defs>
+                    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+                      <stop offset="0" stop-color="#ffe29a" />
+                      <stop offset="0.55" stop-color="#ffb457" />
+                      <stop offset="1" stop-color="#ff7a59" />
+                    </linearGradient>
+                    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0" stop-color="#fffaf0" />
+                      <stop offset="1" stop-color="#ffe7bd" />
+                    </linearGradient>
+                  </defs>
+                  <circle cx="32" cy="32" r="30" fill="url(#bg)" />
+                  <circle
+                    cx="24"
+                    cy="21"
+                    r="17"
+                    fill="#ffffff"
+                    opacity="0.14"
+                  />
+                  <path
+                    d="M15 37c0-9.5 8.5-16 18.5-16 10 0 16.5 5.2 16.5 12.5C50 42 42 48 32 48c-9.6 0-17-4.4-17-11z"
+                    fill="url(#body)"
+                  />
+                  <path
+                    d="M17 33.5l-8-5.5 2.4 9-3.2 5.4 9.4-1.4z"
+                    fill="#f79a3f"
+                  />
+                  <ellipse
+                    cx="28"
+                    cy="39"
+                    rx="9.4"
+                    ry="6.8"
+                    fill="#fff3d6"
+                    transform="rotate(-8 28 39)"
+                  />
+                  <ellipse
+                    cx="27"
+                    cy="36.6"
+                    rx="8"
+                    ry="4.8"
+                    fill="#f7a24b"
+                    transform="rotate(-16 27 36.6)"
+                  />
+                  <circle cx="41.5" cy="29.5" r="5.7" fill="#ffffff" />
+                  <circle cx="43.1" cy="29.8" r="2.9" fill="#20243a" />
+                  <circle cx="44" cy="28.4" r="1.05" fill="#ffffff" />
+                  <path d="M47 33.6l10.5 1.7-9.8 5.6z" fill="#ff9436" />
+                  <path d="M47.8 39.2l8.4-.7-7.6 3.2z" fill="#e0761c" />
+                  <circle
+                    cx="36.5"
+                    cy="38.5"
+                    r="2.7"
+                    fill="#ff7a59"
+                    opacity="0.5"
+                  />
+                </svg>
+              </div>
+              <h1 class="brand-title">Flap<span>bound</span></h1>
+              <p class="brand-tagline">One more flap. One more run.</p>
+            </div>
+
+            <div class="best-card">
+              <div>
+                <div class="best-label" id="menuModeLabel">Classic best</div>
+                <div class="best-value" id="menuModeBest">0</div>
+              </div>
+              <div class="best-divider"></div>
+              <div>
+                <div class="best-label">All-time</div>
+                <div class="best-value" id="menuBest">0</div>
+              </div>
+              <div class="best-divider"></div>
+              <div>
+                <div class="best-label">Runs</div>
+                <div class="best-value" id="menuRuns">0</div>
+              </div>
+            </div>
+
+            <div class="mode-picker" role="group" aria-label="Difficulty">
+              <button class="mode-btn" data-mode="chill">Chill</button>
+              <button class="mode-btn" data-mode="classic">Classic</button>
+              <button class="mode-btn" data-mode="chaos">Chaos</button>
+              <span class="mode-note" id="modeNote"
+                >Gentle gaps. Room to breathe.</span
+              >
+            </div>
+
+            <button class="btn btn-primary btn-play" id="btnPlay">
+              <span>Play</span>
+              <kbd>Space</kbd>
+            </button>
+
+            <div class="menu-actions">
+              <button class="btn btn-ghost" id="btnShop">
+                <span class="shop-dot"></span> Birds
+                <span class="wallet-mini"
+                  ><span class="coin-icon" aria-hidden="true"></span
+                  ><span id="menuCoins">0</span></span
+                >
+              </button>
+              <button class="btn btn-ghost" id="btnGoals">
+                <svg
+                  class="menu-icon"
+                  viewBox="0 0 20 20"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.7"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M4.5 3v14" />
+                  <path d="M4.5 4h9.5l-1.7 3 1.7 3H4.5" />
+                </svg>
+                Goals
+                <span class="goal-count-mini" id="goalMenuCount">0/12</span>
+              </button>
+              <button class="btn btn-ghost" id="btnSound" aria-pressed="true">
+                <span class="sound-icon" aria-hidden="true"></span
+                ><span id="soundLabel">Sound on</span>
+              </button>
+              <button class="btn btn-ghost" id="btnSettings">
+                <svg
+                  class="menu-icon"
+                  viewBox="0 0 20 20"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.7"
+                  stroke-linecap="round"
+                  aria-hidden="true"
+                >
+                  <path d="M3 5h14M3 10h14M3 15h14" />
+                  <circle cx="7" cy="5" r="2" fill="currentColor" />
+                  <circle cx="12" cy="10" r="2" fill="currentColor" />
+                  <circle cx="9" cy="15" r="2" fill="currentColor" />
+                </svg>
+                Settings
+              </button>
+            </div>
+
+            <p class="hint">
+              Tap anywhere · collect coins · chase the perfect pass
+            </p>
+          </div>
+        </section>
+
+        <!-- ============ SHOP ============ -->
+        <section id="shop" class="screen screen-shop" hidden>
+          <div class="panel shop-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Birds</h2>
+                <p class="muted">Give your flapper some flair.</p>
+              </div>
+              <div class="coin-pill small">
+                <span class="coin-icon" aria-hidden="true"></span
+                ><span id="shopCoins">0</span>
+              </div>
+            </div>
+            <div id="skinGrid" class="skin-grid"></div>
+            <div class="panel-foot">
+              <button class="btn btn-ghost" id="btnShopBack">Back</button>
+              <p class="muted tiny" id="skinHint">
+                Coins are earned in every run.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ GOALS ============ -->
+        <section id="goals" class="screen screen-shop" hidden>
+          <div class="panel goals-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Goals</h2>
+                <p class="muted">Chase them down. Earn coins.</p>
+              </div>
+              <div class="goal-count" id="goalCount">0/12</div>
+            </div>
+            <div id="goalList" class="goal-list" role="list"></div>
+            <div class="panel-foot">
+              <button class="btn btn-ghost" id="btnGoalsBack">Back</button>
+              <p class="muted tiny">Rewards are paid automatically.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ SETTINGS ============ -->
+        <section id="settings" class="screen screen-center" hidden>
+          <div class="panel settings-panel">
+            <div class="panel-head">
+              <div>
+                <h2>Settings</h2>
+                <p class="muted">Tune the feel and the sound.</p>
+              </div>
+            </div>
+            <div class="settings-body">
+              <label class="setting" for="sfxRange">
+                <span class="setting-name">Effects</span>
+                <input
+                  id="sfxRange"
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  aria-label="Sound effects volume"
+                />
+                <span class="setting-value" id="sfxValue">90%</span>
+              </label>
+              <label class="setting" for="musicRange">
+                <span class="setting-name">Music</span>
+                <input
+                  id="musicRange"
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  aria-label="Music volume"
+                />
+                <span class="setting-value" id="musicValue">75%</span>
+              </label>
+              <div class="setting setting-toggle">
+                <span class="setting-copy">
+                  <span class="setting-name">Vibration</span>
+                  <span class="setting-hint">A bump on heavy impacts</span>
+                </span>
+                <button
+                  class="switch"
+                  id="btnHaptics"
+                  type="button"
+                  aria-pressed="true"
+                  aria-label="Toggle vibration"
+                >
+                  <span></span>
+                </button>
+              </div>
+              <div class="setting setting-toggle">
+                <span class="setting-copy">
+                  <span class="setting-name">Screen shake</span>
+                  <span class="setting-hint">Extra punch on hits</span>
+                </span>
+                <button
+                  class="switch"
+                  id="btnShake"
+                  type="button"
+                  aria-pressed="true"
+                  aria-label="Toggle screen shake"
+                >
+                  <span></span>
+                </button>
+              </div>
+            </div>
+            <div class="howto">
+              <h3>How to play</h3>
+              <ul>
+                <li><b>Tap or Space</b> to flap. Thread the gaps.</li>
+                <li>
+                  <b>Perfect passes</b> hit the center: extra score and coins.
+                </li>
+                <li>
+                  <b>Grab pickups</b> for a shield, slow motion, or a coin
+                  magnet.
+                </li>
+                <li><b>Close calls</b> skim a pipe for a bonus coin.</li>
+              </ul>
+            </div>
+            <button class="btn btn-primary" id="btnSettingsBack">Done</button>
+          </div>
+        </section>
+
+        <!-- ============ PAUSE ============ -->
+        <section id="pause" class="screen screen-center" hidden>
+          <div class="panel small-panel">
+            <h2>Paused</h2>
+            <p class="muted">Take a breath.</p>
+            <div class="mini-stats">
+              <div>
+                <span class="k">Score</span
+                ><span class="v" id="pauseScore">0</span>
+              </div>
+              <div>
+                <span class="k">Streak</span
+                ><span class="v" id="pauseFlow">0</span>
+              </div>
+              <div>
+                <span class="k">Close</span
+                ><span class="v" id="pauseClose">0</span>
+              </div>
+              <div>
+                <span class="k">Coins</span
+                ><span class="v" id="pauseCoins">0</span>
+              </div>
+            </div>
+            <div class="stack">
+              <button class="btn btn-primary" id="btnResume">Resume</button>
+              <button class="btn btn-ghost" id="btnRestart">Restart</button>
+              <button class="btn btn-ghost" id="btnQuit">Menu</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ GAME OVER ============ -->
+        <section id="over" class="screen screen-center" hidden>
+          <div class="panel over-panel">
+            <div class="medal-wrap">
+              <div
+                id="medal"
+                class="medal"
+                data-tier="none"
+                aria-hidden="true"
+              ></div>
+              <div id="medalLabel" class="medal-label">Keep going</div>
+            </div>
+            <h2 id="overTitle">Nice run</h2>
+            <div class="score-hero"><span id="finalScore">0</span></div>
+            <div class="over-stats">
+              <div>
+                <span class="k">Best</span
+                ><span class="v" id="overBest">0</span>
+              </div>
+              <div>
+                <span class="k">Coins</span
+                ><span class="v" id="overCoins">+0</span>
+              </div>
+              <div>
+                <span class="k">Perfect</span
+                ><span class="v" id="overPerfect">0</span>
+              </div>
+              <div>
+                <span class="k">Streak</span
+                ><span class="v" id="overStreak">0</span>
+              </div>
+              <div>
+                <span class="k">Close</span
+                ><span class="v" id="overClose">0</span>
+              </div>
+              <div>
+                <span class="k">Flaps</span
+                ><span class="v" id="overFlaps">0</span>
+              </div>
+            </div>
+            <p id="newBest" class="new-best" hidden>New best run!</p>
+            <div class="stack">
+              <button class="btn btn-primary" id="btnRetry">
+                Flap again <kbd>R</kbd>
+              </button>
+              <div class="row">
+                <button class="btn btn-ghost" id="btnOverMenu">Menu</button>
+                <button class="btn btn-ghost" id="btnOverShop">Birds</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div
+          id="toast"
+          class="toast"
+          role="status"
+          aria-live="polite"
+          hidden
+        ></div>
+        <div id="flash" class="flash" aria-hidden="true"></div>
+      </div>
+    </div>
+    <script src="audio.js"></script>
+    <script src="game.js"></script>
+  </body>
+</html>
