@@ -468,23 +468,107 @@
   const view = {
     cw: 0,
     ch: 0,
-    dpr: 1,
-    scale: 1,
+    rs: 1, // backing-store pixels per CSS pixel (varies with quality)
+    scale: 1, // design units -> CSS pixels
     vw: W,
     vh: BASE_H,
     groundY: BASE_H - GROUND_H,
     playX: 0,
     birdX: 150,
   };
+  // Adaptive renderer ------------------------------------------------------
+  // Canvas 2D cost is dominated by backing-store pixels and per-frame draw
+  // calls. We render into a device-pixel budget and step the resolution down
+  // when a device cannot hold the frame rate (and back up when it can).
+  const perf = {
+    level: 2, // 2 = crisp, 1 = balanced, 0 = fastest
+    base: 1,
+    work: 6, // EMA of milliseconds spent building one frame
+    slow: 0,
+    good: 0,
+    lastCheck: performance.now(),
+    warmup: performance.now() + 2500,
+    lastDown: 0,
+  };
+  const QUALITY_SCALE = [0.7, 0.85, 1];
+  function pixelBudget() {
+    const cores = navigator.hardwareConcurrency || 4;
+    // deviceMemory is Chromium-only; assume a mid-range phone elsewhere and
+    // let the core count and adaptive quality pass handle weaker devices.
+    const mem = navigator.deviceMemory || 8;
+    const coarse =
+      window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+    if (cores <= 4 || mem <= 4) return coarse ? 900_000 : 1_300_000;
+    return coarse ? 1_800_000 : 2_400_000;
+  }
+  function computeBaseScale() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const px = view.cw * view.ch;
+    const budget = pixelBudget();
+    let scale = dpr;
+    if (px * scale * scale > budget) scale = Math.sqrt(budget / px);
+    return clamp(scale, 0.6, 2);
+  }
+  function applyCanvasSize() {
+    perf.base = computeBaseScale();
+    const rs = clamp(perf.base * QUALITY_SCALE[perf.level], 0.5, 2);
+    if (Math.abs(rs - view.rs) < 0.002) return;
+    view.rs = rs;
+    canvas.width = Math.max(1, Math.round(view.cw * rs));
+    canvas.height = Math.max(1, Math.round(view.ch * rs));
+  }
+  function setQuality(level) {
+    level = clamp(level, 0, 2);
+    if (level === perf.level) return;
+    perf.level = level;
+    applyCanvasSize();
+    // Rebuild cached art one layer per frame so changing quality never causes
+    // a single long frame.
+    invalidateArt(true, false);
+  }
+  function sampleFrame(work) {
+    // Sampling actual draw time (instead of the rAF interval) keeps a 30 Hz
+    // display or a briefly stalled tab from forcing needless quality drops.
+    perf.work += (work - perf.work) * 0.1;
+    const now = performance.now();
+    if (now < perf.warmup) return;
+    if (now - perf.lastCheck < 1000) return;
+    perf.lastCheck = now;
+    perf.slow = perf.work > 11 ? perf.slow + 1 : 0;
+    perf.good = perf.work < 6.5 ? perf.good + 1 : 0;
+    if (perf.slow >= 2 && perf.level > 0) {
+      setQuality(perf.level - 1);
+      perf.work = 6;
+      perf.slow = 0;
+      perf.good = 0;
+      perf.lastDown = now;
+      perf.warmup = now + 900;
+    } else if (
+      perf.good >= 3 &&
+      perf.level < 2 &&
+      now - perf.lastDown > 8000
+    ) {
+      setQuality(perf.level + 1);
+      perf.work = 6;
+      perf.slow = 0;
+      perf.good = 0;
+      perf.warmup = now + 900;
+    }
+  }
   function resize() {
     const cw = Math.max(1, window.innerWidth);
     const ch = Math.max(1, window.innerHeight);
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
     view.cw = cw;
     view.ch = ch;
-    view.dpr = dpr;
-    canvas.width = Math.round(cw * dpr);
-    canvas.height = Math.round(ch * dpr);
+    perf.base = computeBaseScale();
+    const rs = clamp(perf.base * QUALITY_SCALE[perf.level], 0.5, 2);
+    view.rs = rs;
+    const bw = Math.max(1, Math.round(cw * rs));
+    const bh = Math.max(1, Math.round(ch * rs));
+    if (canvas.width !== bw || canvas.height !== bh) {
+      canvas.width = bw;
+      canvas.height = bh;
+    }
     canvas.style.width = cw + 'px';
     canvas.style.height = ch + 'px';
     const scale = Math.min(cw / W, ch / BASE_H);
@@ -494,6 +578,7 @@
     view.groundY = view.vh - GROUND_H;
     view.playX = (view.vw - W) / 2;
     view.birdX = view.playX + 150;
+    invalidateArt(true);
     if (game) {
       game.bird.x = view.birdX;
       if (game.scene === 'menu' || game.scene === 'shop')
@@ -531,7 +616,6 @@
     closePulse: 0,
     invuln: 0,
     shake: 0,
-    flash: 0,
     hitstop: 0,
     deathTimer: 0,
     deathHandled: false,
@@ -570,6 +654,7 @@
     shopHint: $('#skinHint'),
     goalList: $('#goalList'),
     goalCount: $('#goalCount'),
+    flash: $('#flash'),
     sfxRange: $('#sfxRange'),
     musicRange: $('#musicRange'),
     sfxValue: $('#sfxValue'),
@@ -615,8 +700,12 @@
     const c = hexRgb(hex);
     return `rgba(${c[0]},${c[1]},${c[2]},${a})`;
   }
-  function paletteNow() {
-    const pos = ((game.day % 4) + 4) % 4;
+  // The day palette drifts very slowly (a full cycle takes ~5.5 minutes), so
+  // rebuilding it a couple of times a second is invisible and avoids string
+  // and object churn on every frame.
+  const PALETTE_STEP = 0.012;
+  let paletteCache = { pos: -99, p: null };
+  function buildPalette(pos) {
     const i = Math.floor(pos);
     const f = pos - i;
     const A = PALETTES[i],
@@ -628,6 +717,19 @@
         typeof A[k] === 'number' ? lerp(A[k], B[k], f) : mixHex(A[k], B[k], f);
     }
     return out;
+  }
+  function paletteNow() {
+    const pos = ((game.day % 4) + 4) % 4;
+    if (
+      paletteCache.p &&
+      Math.abs(pos - paletteCache.pos) < PALETTE_STEP &&
+      pos >= paletteCache.pos
+    )
+      return paletteCache.p;
+    paletteCache.pos = pos;
+    paletteCache.p = buildPalette(pos);
+    onPaletteChange();
+    return paletteCache.p;
   }
   function roundRect(c, x, y, w, h, r) {
     r = Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2);
@@ -651,6 +753,122 @@
     }
     c.closePath();
   }
+  // ----------------------------------------------------------- layer cache
+  // Slowly changing or static art (sun, stars, clouds, hills, pipes, coins,
+  // pickups) is rasterised once into small offscreen canvases and blitted.
+  // That removes the per-frame gradient creation, shadow blur and hundreds of
+  // tiny path fills that made slower phones drop frames.
+  const layerCache = {
+    sun: null,
+    stars: null,
+    hills: null,
+    clouds: null,
+    pipeBody: null,
+    pipeCapDown: null,
+    pipeCapUp: null,
+    coin: null,
+    shield: null,
+    glow: null,
+    power: null,
+    groundBump: null,
+    groundStripe: null,
+  };
+  const artQueue = [];
+  const artState = { last: {}, burst: true };
+  let artBuilt = 0;
+  const ART_INTERVAL = {
+    sun: 0.8,
+    clouds: 1.6,
+    hills: 3,
+    pipes: 1.2,
+    ground: 2.5,
+  };
+  let bgRevision = 0;
+  function invalidateBg() {
+    bgRevision++;
+  }
+  function artScale() {
+    return clamp(view.rs * view.scale, 1, 2);
+  }
+  function createLayer(w, h, scale) {
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(w * scale));
+    c.height = Math.max(1, Math.round(h * scale));
+    const g = c.getContext('2d');
+    g.setTransform(scale, 0, 0, scale, 0, 0);
+    return { canvas: c, ctx: g, w, h, scale };
+  }
+  function resetLayer(layer, w, h, scale) {
+    w = Math.max(1, w);
+    h = Math.max(1, h);
+    if (!layer) return createLayer(w, h, scale);
+    if (layer.scale !== scale || layer.w !== w || layer.h !== h) {
+      layer.scale = scale;
+      layer.w = w;
+      layer.h = h;
+      layer.canvas.width = Math.round(w * scale);
+      layer.canvas.height = Math.round(h * scale);
+    }
+    const g = layer.ctx;
+    g.setTransform(scale, 0, 0, scale, 0, 0);
+    g.globalAlpha = 1;
+    g.globalCompositeOperation = 'source-over';
+    g.setLineDash([]);
+    g.clearRect(0, 0, w, h);
+    return layer;
+  }
+  function queueArt(name, force) {
+    if (!force) {
+      const last = artState.last[name];
+      const wait = ART_INTERVAL[name] || 0;
+      if (last != null && game.time - last < wait) return;
+    }
+    if (artQueue.indexOf(name) < 0) artQueue.push(name);
+  }
+  function invalidateArt(all, burst = true) {
+    if (all) {
+      artQueue.length = 0;
+      artState.burst = burst;
+      const names = [
+        'sun',
+        'stars',
+        'hills',
+        'clouds',
+        'pipes',
+        'ground',
+        'sprites',
+      ];
+      for (let i = 0; i < names.length; i++) artQueue.push(names[i]);
+    }
+    invalidateBg();
+  }
+  function onPaletteChange() {
+    invalidateBg();
+    queueArt('sun');
+    queueArt('clouds');
+    queueArt('hills');
+    queueArt('pipes');
+    queueArt('ground');
+  }
+  function flushArt() {
+    const limit = artState.burst ? 8 : 1;
+    artState.burst = false;
+    let n = 0;
+    while (artQueue.length && n < limit) {
+      const name = artQueue.shift();
+      artState.last[name] = game.time;
+      if (name === 'sun') buildSun();
+      else if (name === 'stars') buildStars();
+      else if (name === 'hills') buildHills();
+      else if (name === 'clouds') buildClouds();
+      else if (name === 'pipes') buildPipes();
+      else if (name === 'ground') buildGround();
+      else if (name === 'sprites') buildSprites();
+      n++;
+      artBuilt++;
+    }
+  }
+
   // ------------------------------------------------------------- seed data
   const STAR_SEEDS = Array.from({ length: 80 }, () => ({
     u: Math.random(),
@@ -674,112 +892,198 @@
     sp: rand(0.2, 0.6),
   }));
   // ------------------------------------------------------------ background
-  function drawSky(p) {
-    const { vw, groundY } = view;
+  const HILL_DEFS = [
+    { color: 'hillFar', base: -96, amp: 26, k: 0.01, sp: 0.16, seed: 0 },
+    { color: 'hillNear', base: -52, amp: 22, k: 0.015, sp: 0.34, seed: 120 },
+  ];
+  const bgGrad = {
+    rev: -1,
+    sky: null,
+    soil: null,
+    shade: null,
+    groundBumpPat: null,
+    groundStripePat: null,
+  };
+  function ensureGradients(p) {
+    if (bgGrad.rev === bgRevision) return;
+    bgGrad.rev = bgRevision;
+    const { groundY, vh } = view;
     const sky = ctx.createLinearGradient(0, -40, 0, groundY + 20);
     sky.addColorStop(0, p.top);
     sky.addColorStop(0.55, p.mid);
     sky.addColorStop(1, p.bottom);
-    ctx.fillStyle = sky;
-    ctx.fillRect(-60, -60, vw + 120, groundY + 120);
+    bgGrad.sky = sky;
+    const soil = ctx.createLinearGradient(0, groundY, 0, vh);
+    soil.addColorStop(0, p.ground);
+    soil.addColorStop(1, p.groundDark);
+    bgGrad.soil = soil;
+    const shade = ctx.createLinearGradient(0, groundY, 0, groundY + 50);
+    shade.addColorStop(0, 'rgba(8,10,22,0.28)');
+    shade.addColorStop(1, 'rgba(8,10,22,0)');
+    bgGrad.shade = shade;
   }
-  function drawOrb(t, p) {
-    const { vw, vh, groundY } = view;
-    const ox = vw * 0.76;
-    const oy = Math.min(vh * 0.19, groundY * 0.3) + Math.sin(t * 0.12) * 5;
-    const r = 33;
+  function drawSky(p) {
+    ensureGradients(p);
+    ctx.fillStyle = bgGrad.sky;
+    ctx.fillRect(-60, -60, view.vw + 120, view.groundY + 120);
+  }
+  function buildSun() {
+    const p = paletteCache.p || PALETTES[0];
+    const S = 260,
+      C = 130,
+      r = 33;
+    const layer = resetLayer(layerCache.sun, S, S, artScale());
+    const g = layer.ctx;
+    g.translate(C, C);
     const night = p.night > 0.55;
-    const glow = ctx.createRadialGradient(ox, oy, r * 0.3, ox, oy, r * 3.6);
+    const glow = g.createRadialGradient(0, 0, r * 0.3, 0, 0, r * 3.6);
     glow.addColorStop(0, withAlpha(p.orb, night ? 0.28 : 0.42));
     glow.addColorStop(1, withAlpha(p.orb, 0));
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(ox, oy, r * 3.6, 0, TAU);
-    ctx.fill();
+    g.fillStyle = glow;
+    g.beginPath();
+    g.arc(0, 0, r * 3.6, 0, TAU);
+    g.fill();
     if (!night) {
-      ctx.save();
-      ctx.translate(ox, oy);
-      ctx.rotate(t * 0.05);
-      ctx.globalAlpha = 0.16;
-      ctx.strokeStyle = p.orb;
-      ctx.lineWidth = 2.5;
+      g.globalAlpha = 0.16;
+      g.strokeStyle = p.orb;
+      g.lineWidth = 2.5;
       for (let i = 0; i < 12; i++) {
         const a = (i / 12) * TAU;
-        ctx.beginPath();
-        ctx.moveTo(Math.cos(a) * (r + 10), Math.sin(a) * (r + 10));
-        ctx.lineTo(Math.cos(a) * (r + 22), Math.sin(a) * (r + 22));
-        ctx.stroke();
+        g.beginPath();
+        g.moveTo(Math.cos(a) * (r + 10), Math.sin(a) * (r + 10));
+        g.lineTo(Math.cos(a) * (r + 22), Math.sin(a) * (r + 22));
+        g.stroke();
       }
-      ctx.restore();
+      g.globalAlpha = 1;
     }
-    const body = ctx.createLinearGradient(ox, oy - r, ox, oy + r);
+    const body = g.createLinearGradient(0, -r, 0, r);
     body.addColorStop(0, '#ffffff');
     body.addColorStop(0.45, p.orb);
     body.addColorStop(1, withAlpha(p.orb, 0.85));
-    ctx.fillStyle = body;
-    ctx.beginPath();
-    ctx.arc(ox, oy, r, 0, TAU);
-    ctx.fill();
+    g.fillStyle = body;
+    g.beginPath();
+    g.arc(0, 0, r, 0, TAU);
+    g.fill();
     if (night) {
-      ctx.fillStyle = 'rgba(70,88,125,0.18)';
-      [
+      g.fillStyle = 'rgba(70,88,125,0.18)';
+      const craters = [
         [-10, -8, 7],
         [9, 4, 5],
         [-2, 13, 3.5],
         [12, -12, 3],
-      ].forEach(([x, y, rr]) => {
-        ctx.beginPath();
-        ctx.arc(ox + x, oy + y, rr, 0, TAU);
-        ctx.fill();
-      });
-      ctx.fillStyle = 'rgba(255,255,255,0.55)';
-      ctx.beginPath();
-      ctx.arc(ox - 9, oy - 9, 8, Math.PI * 0.8, Math.PI * 1.7);
-      ctx.fill();
+      ];
+      for (let i = 0; i < craters.length; i++) {
+        const c = craters[i];
+        g.beginPath();
+        g.arc(c[0], c[1], c[2], 0, TAU);
+        g.fill();
+      }
+      g.fillStyle = 'rgba(255,255,255,0.55)';
+      g.beginPath();
+      g.arc(-9, -9, 8, Math.PI * 0.8, Math.PI * 1.7);
+      g.fill();
+    }
+    layerCache.sun = layer;
+  }
+  function drawOrb(t, p) {
+    if (!layerCache.sun) return;
+    const { vw, vh, groundY } = view;
+    const ox = vw * 0.76;
+    const oy = Math.min(vh * 0.19, groundY * 0.3) + Math.sin(t * 0.12) * 5;
+    const night = p.night > 0.55;
+    ctx.save();
+    ctx.translate(ox, oy);
+    if (!night) ctx.rotate(t * 0.05);
+    ctx.drawImage(layerCache.sun.canvas, -130, -130, 260, 260);
+    ctx.restore();
+  }
+  function buildStars() {
+    const layers = layerCache.stars || (layerCache.stars = []);
+    const w = Math.ceil(view.vw);
+    const h = Math.ceil(view.vh * 0.85);
+    const scale = Math.min(1.5, artScale());
+    for (let gi = 0; gi < 4; gi++) {
+      const layer = resetLayer(layers[gi], w, h, scale);
+      const g = layer.ctx;
+      g.fillStyle = '#ffffff';
+      for (let i = gi; i < STAR_SEEDS.length; i += 4) {
+        const s = STAR_SEEDS[i];
+        g.beginPath();
+        g.arc(s.u * w, s.v * h, s.r, 0, TAU);
+        g.fill();
+      }
+      layers[gi] = layer;
     }
   }
   function drawStars(t, p) {
-    if (p.stars < 0.02) return;
-    const { vw, vh } = view;
-    ctx.save();
-    for (const s of STAR_SEEDS) {
-      const tw = 0.45 + 0.55 * Math.sin(t * s.tw + s.ph);
-      ctx.globalAlpha = clamp(p.stars * tw, 0, 1) * 0.9;
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.arc(s.u * vw, s.v * vh * 0.85, s.r, 0, TAU);
-      ctx.fill();
+    if (p.stars < 0.02 || !layerCache.stars) return;
+    const layers = layerCache.stars;
+    const first = layers[0];
+    if (!first) return;
+    const base = p.stars * 0.9;
+    for (let i = 0; i < layers.length; i++) {
+      const layer = layers[i];
+      if (!layer) continue;
+      const tw =
+        0.4 + 0.6 * (0.5 + 0.5 * Math.sin(t * 0.8 + i * 1.7 + i * 0.6));
+      ctx.globalAlpha = clamp(base * tw, 0, 1);
+      ctx.drawImage(layer.canvas, 0, 0, layer.w, layer.h);
     }
-    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+  function buildClouds() {
+    const p = paletteCache.p || PALETTES[0];
+    const layers = layerCache.clouds || (layerCache.clouds = []);
+    const scale = Math.min(2, artScale());
+    for (let i = 0; i < CLOUD_SEEDS.length; i++) {
+      const c = CLOUD_SEEDS[i];
+      const s = c.s * 46;
+      const w = Math.ceil(s * 2.5);
+      const h = Math.ceil(s * 1.5);
+      const layer = resetLayer(layers[i], w, h, scale);
+      const g = layer.ctx;
+      g.translate(w / 2, h / 2);
+      g.fillStyle = p.cloud;
+      g.beginPath();
+      g.ellipse(0, 0, s * 1.1, s * 0.5, 0, 0, TAU);
+      g.ellipse(-s * 0.62, s * 0.1, s * 0.55, s * 0.36, 0, 0, TAU);
+      g.ellipse(s * 0.55, s * 0.06, s * 0.6, s * 0.4, 0, 0, TAU);
+      g.ellipse(s * 0.05, -s * 0.34, s * 0.52, s * 0.42, 0, 0, TAU);
+      g.fill();
+      g.globalAlpha = 0.35;
+      g.fillStyle = p.cloudShade;
+      g.beginPath();
+      g.ellipse(0, s * 0.26, s * 0.92, s * 0.2, 0, 0, TAU);
+      g.fill();
+      layers[i] = layer;
+    }
   }
   function drawClouds(t, p) {
-    const { vw, vh, groundY } = view;
+    const layers = layerCache.clouds;
+    if (!layers) return;
+    const { vw, groundY } = view;
     const span = vw + 340;
-    for (const c of CLOUD_SEEDS) {
-      let x =
+    for (let i = 0; i < CLOUD_SEEDS.length; i++) {
+      const c = CLOUD_SEEDS[i];
+      const layer = layers[i];
+      if (!layer) continue;
+      const x =
         ((((c.u * span - game.scroll * 0.045 * c.sp) % span) + span) % span) -
         170;
       const y = c.y * groundY;
-      const s = c.s * 46;
-      ctx.save();
-      ctx.translate(x, y);
       ctx.globalAlpha = c.a * (0.75 + 0.25 * Math.cos(t * 0.2 + c.u * 9));
-      ctx.fillStyle = p.cloud;
-      ctx.beginPath();
-      ctx.ellipse(0, 0, s * 1.1, s * 0.5, 0, 0, TAU);
-      ctx.ellipse(-s * 0.62, s * 0.1, s * 0.55, s * 0.36, 0, 0, TAU);
-      ctx.ellipse(s * 0.55, s * 0.06, s * 0.6, s * 0.4, 0, 0, TAU);
-      ctx.ellipse(s * 0.05, -s * 0.34, s * 0.52, s * 0.42, 0, 0, TAU);
-      ctx.fill();
-      ctx.globalAlpha *= 0.35;
-      ctx.fillStyle = p.cloudShade;
-      ctx.beginPath();
-      ctx.ellipse(0, s * 0.26, s * 0.92, s * 0.2, 0, 0, TAU);
-      ctx.fill();
-      ctx.restore();
+      ctx.drawImage(
+        layer.canvas,
+        x - layer.w / 2,
+        y - layer.h / 2,
+        layer.w,
+        layer.h,
+      );
     }
+    ctx.globalAlpha = 1;
   }
   function drawFlocks(t, p) {
+    if (perf.level < 1) return;
     const { vw, vh } = view;
     ctx.save();
     ctx.strokeStyle =
@@ -803,50 +1107,93 @@
     }
     ctx.restore();
   }
-  function drawHills(t, p) {
-    const { vw, groundY } = view;
-    const layers = [
-      {
-        color: p.hillFar,
-        base: groundY - 96,
-        amp: 26,
-        k: 0.01,
-        sp: 0.16,
-        seed: 0,
-      },
-      {
-        color: p.hillNear,
-        base: groundY - 52,
-        amp: 22,
-        k: 0.015,
-        sp: 0.34,
-        seed: 120,
-      },
-    ];
-    for (const L of layers) {
-      const off = game.scroll * L.sp;
-      ctx.beginPath();
-      ctx.moveTo(-60, groundY + 10);
-      for (let x = -60; x <= vw + 60; x += 18) {
-        const y =
-          L.base +
-          Math.sin((x + off + L.seed) * L.k) * L.amp +
-          Math.sin((x + off + L.seed) * L.k * 2.4) * L.amp * 0.3;
-        ctx.lineTo(x, y);
+  function hillPattern(layer, period) {
+    let pat = null;
+    try {
+      pat = ctx.createPattern(layer.canvas, 'repeat-x');
+      if (pat && pat.setTransform) {
+        // Match the tile to the exact design-space period so the phase does
+        // not drift across repeats.
+        pat.setTransform({
+          a: period / layer.canvas.width,
+          b: 0,
+          c: 0,
+          d: layer.h / layer.canvas.height,
+          e: 0,
+          f: 0,
+        });
       }
-      ctx.lineTo(vw + 60, groundY + 10);
-      ctx.closePath();
-      ctx.fillStyle = L.color;
-      ctx.fill();
+    } catch (e) {
+      pat = null;
+    }
+    return pat;
+  }
+  function buildHills() {
+    const p = paletteCache.p || PALETTES[0];
+    const layers = layerCache.hills || (layerCache.hills = []);
+    const scale = Math.min(1.5, artScale());
+    const bottom = view.groundY + 12;
+    for (let i = 0; i < 2; i++) {
+      const L = HILL_DEFS[i];
+      // The detail sine runs at 2.5x the base frequency, so the combined shape
+      // repeats every two base periods. Tiling on that period avoids a visible
+      // step at the tile seam.
+      const period = (TAU / L.k) * 2;
+      const top = Math.max(0, view.groundY + L.base - L.amp * 1.6);
+      const h = Math.max(1, Math.ceil(bottom - top));
+      const layer = resetLayer(layers[i], period, h, scale);
+      const g = layer.ctx;
+      const base = view.groundY + L.base - top;
+      const crest = (x) =>
+        base +
+        Math.sin((x + L.seed) * L.k) * L.amp +
+        Math.sin((x + L.seed) * L.k * 2.5) * L.amp * 0.3;
+      // Draw past both tile edges so the pattern's edge pixels are fully
+      // opaque; otherwise the wrap blends two antialiased columns and leaves
+      // a translucent hairline at every repeat.
+      g.beginPath();
+      g.moveTo(-4, h);
+      g.lineTo(-4, crest(-4));
+      for (let x = 2; x <= period + 4; x += 6) g.lineTo(x, crest(x));
+      g.lineTo(period + 4, crest(period + 4));
+      g.lineTo(period + 4, h);
+      g.closePath();
+      g.fillStyle = p[L.color];
+      g.fill();
+      // Highlight only the crest; stroking the closed path would draw seams
+      // down the tile edges.
+      g.beginPath();
+      g.moveTo(-4, crest(-4));
+      for (let x = 2; x <= period + 4; x += 6) g.lineTo(x, crest(x));
+      g.lineTo(period + 4, crest(period + 4));
+      g.globalAlpha = 0.16;
+      g.strokeStyle = '#ffffff';
+      g.lineWidth = 1.5;
+      g.stroke();
+      layer.top = top;
+      layer.pattern = hillPattern(layer, period);
+      layers[i] = layer;
+    }
+  }
+  function drawHills(t, p) {
+    const layers = layerCache.hills;
+    if (!layers) return;
+    const { vw } = view;
+    for (let i = 0; i < 2; i++) {
+      const L = HILL_DEFS[i];
+      const layer = layers[i];
+      if (!layer || !layer.pattern) continue;
+      const period = (TAU / L.k) * 2;
+      const off = (((game.scroll * L.sp) % period) + period) % period;
       ctx.save();
-      ctx.globalAlpha = 0.16;
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
+      ctx.translate(-off, layer.top);
+      ctx.fillStyle = layer.pattern;
+      ctx.fillRect(off, 0, vw + 4, layer.h);
       ctx.restore();
     }
   }
   function drawMotes(t, p) {
+    if (perf.level < 1) return;
     const { vw, groundY } = view;
     ctx.save();
     ctx.fillStyle = p.night > 0.5 ? '#cfe6ff' : '#fff4d8';
@@ -860,103 +1207,172 @@
     }
     ctx.restore();
   }
+
   // ---------------------------------------------------------------- ground
+  function makePattern(layer) {
+    let pat = null;
+    try {
+      pat = ctx.createPattern(layer.canvas, 'repeat');
+      if (pat && pat.setTransform && layer.scale !== 1) {
+        const k = 1 / layer.scale;
+        pat.setTransform({ a: k, b: 0, c: 0, d: k, e: 0, f: 0 });
+      }
+    } catch (e) {
+      pat = null;
+    }
+    return pat;
+  }
+  function buildGround() {
+    const p = paletteCache.p || PALETTES[0];
+    const bump = resetLayer(layerCache.groundBump, 28, 18, 1);
+    const g = bump.ctx;
+    g.fillStyle = p.grass;
+    g.beginPath();
+    g.arc(14, 9, 9, 0, Math.PI);
+    g.fill();
+    layerCache.groundBump = bump;
+    const top = view.groundY + 21;
+    const h = Math.max(1, Math.ceil(view.vh - top));
+    const stripe = resetLayer(layerCache.groundStripe, 42, h, 1);
+    const s = stripe.ctx;
+    s.strokeStyle = 'rgba(0,0,0,0.1)';
+    s.lineWidth = 7;
+    s.beginPath();
+    s.moveTo(0, 9);
+    s.lineTo(34, h + 10);
+    s.stroke();
+    s.strokeStyle = 'rgba(255,255,255,0.05)';
+    s.lineWidth = 2;
+    s.beginPath();
+    s.moveTo(5, 9);
+    s.lineTo(39, h + 10);
+    s.stroke();
+    layerCache.groundStripe = stripe;
+    bgGrad.groundBumpPat = makePattern(bump);
+    bgGrad.groundStripePat = makePattern(stripe);
+  }
   function drawGround(t, p) {
+    ensureGradients(p);
     const { vw, vh, groundY } = view;
-    const soil = ctx.createLinearGradient(0, groundY, 0, vh);
-    soil.addColorStop(0, p.ground);
-    soil.addColorStop(1, p.groundDark);
-    ctx.fillStyle = soil;
+    ctx.fillStyle = bgGrad.soil;
     ctx.fillRect(-60, groundY, vw + 120, vh - groundY + 60);
-    const off = game.scroll % 28;
-    ctx.fillStyle = p.grass;
-    for (let x = -40 + off; x < vw + 40; x += 28) {
-      ctx.beginPath();
-      ctx.arc(x, groundY + 15, 9, 0, Math.PI);
-      ctx.fill();
+    const bump = layerCache.groundBump;
+    const bumpPat = bgGrad.groundBumpPat;
+    if (bump && bumpPat) {
+      const off = game.scroll % 28;
+      ctx.save();
+      ctx.translate(off, groundY + 6);
+      ctx.fillStyle = bumpPat;
+      ctx.fillRect(-off - 60, 0, vw + 120, 18);
+      ctx.restore();
     }
     ctx.fillStyle = p.grassDark;
     ctx.fillRect(-60, groundY + 15, vw + 120, 6);
     ctx.fillStyle = p.grass;
     ctx.fillRect(-60, groundY + 6, vw + 120, 10);
-    ctx.fillStyle = withAlpha('#ffffff', 0.22);
+    ctx.fillStyle = 'rgba(255,255,255,0.22)';
     ctx.fillRect(-60, groundY + 5, vw + 120, 2);
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(0, groundY + 21, vw, vh - groundY);
-    ctx.clip();
-    ctx.strokeStyle = 'rgba(0,0,0,0.1)';
-    ctx.lineWidth = 7;
-    const off2 = (game.scroll * 0.55) % 42;
-    for (let x = -80 + off2; x < vw + 100; x += 42) {
-      ctx.beginPath();
-      ctx.moveTo(x, groundY + 30);
-      ctx.lineTo(x + 34, vh + 10);
-      ctx.stroke();
+    const stripe = layerCache.groundStripe;
+    const stripePat = bgGrad.groundStripePat;
+    if (stripe && stripePat) {
+      const top = groundY + 21;
+      const off2 = (game.scroll * 0.55) % 42;
+      ctx.save();
+      ctx.translate(off2, top);
+      ctx.fillStyle = stripePat;
+      ctx.fillRect(-off2, 0, vw, vh - top);
+      ctx.restore();
     }
-    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-    ctx.lineWidth = 2;
-    for (let x = -80 + off2; x < vw + 100; x += 42) {
-      ctx.beginPath();
-      ctx.moveTo(x + 5, groundY + 30);
-      ctx.lineTo(x + 39, vh + 10);
-      ctx.stroke();
-    }
-    ctx.restore();
-    const shade = ctx.createLinearGradient(0, groundY, 0, groundY + 50);
-    shade.addColorStop(0, 'rgba(8,10,22,0.28)');
-    shade.addColorStop(1, 'rgba(8,10,22,0)');
-    ctx.fillStyle = shade;
+    ctx.fillStyle = bgGrad.shade;
     ctx.fillRect(-60, groundY, vw + 120, 50);
   }
   // ----------------------------------------------------------------- pipes
+  function buildPipes() {
+    const p = paletteCache.p || PALETTES[0];
+    const scale = Math.min(2, artScale());
+    const body = resetLayer(layerCache.pipeBody, PIPE_W, 4, scale);
+    const b = body.ctx;
+    const bg = b.createLinearGradient(0, 0, PIPE_W, 0);
+    bg.addColorStop(0, p.pipeDark);
+    bg.addColorStop(0.16, p.pipe);
+    bg.addColorStop(0.42, p.pipeLight);
+    bg.addColorStop(0.58, p.pipe);
+    bg.addColorStop(0.88, p.pipeDark);
+    bg.addColorStop(1, p.pipeDark);
+    b.fillStyle = bg;
+    b.fillRect(0, 0, PIPE_W, 4);
+    b.fillStyle = 'rgba(255,255,255,0.16)';
+    b.fillRect(12, 0, 7, 4);
+    b.fillStyle = 'rgba(0,0,0,0.12)';
+    b.fillRect(PIPE_W - 7, 0, 7, 4);
+    layerCache.pipeBody = body;
+    const capW = PIPE_W + 10;
+    const capH = 22;
+    for (let flip = 0; flip < 2; flip++) {
+      const key = flip ? 'pipeCapUp' : 'pipeCapDown';
+      const cap = resetLayer(layerCache[key], capW, capH, scale);
+      const g = cap.ctx;
+      const cg = g.createLinearGradient(0, 0, capW, 0);
+      cg.addColorStop(0, p.pipeDark);
+      cg.addColorStop(0.18, p.cap);
+      cg.addColorStop(0.4, p.pipeLight);
+      cg.addColorStop(0.7, p.cap);
+      cg.addColorStop(1, p.pipeDark);
+      g.fillStyle = cg;
+      roundRect(g, 0, 0, capW, capH, 7);
+      g.fill();
+      g.strokeStyle = 'rgba(0,0,0,0.2)';
+      g.lineWidth = 1.5;
+      g.stroke();
+      g.fillStyle = 'rgba(255,255,255,0.22)';
+      roundRect(g, 10, flip ? 6 : 4, 8, capH - 10, 4);
+      g.fill();
+      layerCache[key] = cap;
+    }
+  }
   function drawPipes(p) {
+    const body = layerCache.pipeBody;
+    const capDown = layerCache.pipeCapDown;
+    const capUp = layerCache.pipeCapUp;
+    if (!body) return;
     for (const pipe of game.pipes) {
       const gapTop = pipe.center - pipe.gap / 2;
       const gapBot = pipe.center + pipe.gap / 2;
-      drawPipeBody(pipe.x, -40, PIPE_W, gapTop - 22 + 40, p);
-      drawPipeCap(pipe.x - 5, gapTop - 22, PIPE_W + 10, 22, p, false);
-      drawPipeCap(pipe.x - 5, gapBot, PIPE_W + 10, 22, p, true);
-      drawPipeBody(pipe.x, gapBot + 22, PIPE_W, view.groundY - gapBot + 30, p);
+      drawPipeBody(pipe.x, -40, PIPE_W, gapTop - 22 + 40, body);
+      if (capDown)
+        ctx.drawImage(capDown.canvas, pipe.x - 5, gapTop - 22, PIPE_W + 10, 22);
+      if (capUp)
+        ctx.drawImage(capUp.canvas, pipe.x - 5, gapBot, PIPE_W + 10, 22);
+      drawPipeBody(pipe.x, gapBot + 22, PIPE_W, view.groundY - gapBot + 30, body);
     }
   }
-  function drawPipeBody(x, y, w, h, p) {
+  function drawPipeBody(x, y, w, h, body) {
     if (h <= 0) return;
-    const g = ctx.createLinearGradient(x, 0, x + w, 0);
-    g.addColorStop(0, p.pipeDark);
-    g.addColorStop(0.16, p.pipe);
-    g.addColorStop(0.42, p.pipeLight);
-    g.addColorStop(0.58, p.pipe);
-    g.addColorStop(0.88, p.pipeDark);
-    g.addColorStop(1, p.pipeDark);
-    ctx.fillStyle = g;
-    ctx.fillRect(x, y, w, h);
-    ctx.fillStyle = 'rgba(255,255,255,0.16)';
-    ctx.fillRect(x + 12, y, 7, h);
-    ctx.fillStyle = 'rgba(0,0,0,0.12)';
-    ctx.fillRect(x + w - 7, y, 7, h);
+    ctx.drawImage(body.canvas, x, y, w, h);
     ctx.strokeStyle = 'rgba(0,0,0,0.16)';
     ctx.lineWidth = 1.5;
     ctx.strokeRect(x + 0.75, y, w - 1.5, h);
   }
-  function drawPipeCap(x, y, w, h, p, flip) {
-    const g = ctx.createLinearGradient(x, 0, x + w, 0);
-    g.addColorStop(0, p.pipeDark);
-    g.addColorStop(0.18, p.cap);
-    g.addColorStop(0.4, p.pipeLight);
-    g.addColorStop(0.7, p.cap);
-    g.addColorStop(1, p.pipeDark);
-    ctx.fillStyle = g;
-    roundRect(ctx, x, y, w, h, 7);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(0,0,0,0.2)';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-    ctx.fillStyle = 'rgba(255,255,255,0.22)';
-    roundRect(ctx, x + 10, y + (flip ? 6 : 4), 8, h - 10, 4);
-    ctx.fill();
-  }
   // ------------------------------------------------------------------ bird
+  // Gradients are local to the translated/rotated bird, so they can be reused
+  // for every draw (including the shop's animated previews).
+  const birdGradCache = new WeakMap();
+  function birdBodyGradient(c, r, skin) {
+    let map = birdGradCache.get(c);
+    if (!map) {
+      map = new Map();
+      birdGradCache.set(c, map);
+    }
+    const key = skin.id + '|' + r;
+    let g = map.get(key);
+    if (!g) {
+      g = c.createLinearGradient(0, -r, 0, r);
+      g.addColorStop(0, skin.bodyLight || skin.body);
+      g.addColorStop(1, skin.body);
+      map.set(key, g);
+    }
+    return g;
+  }
   function drawBirdShape(c, x, y, r, rot, skin, wingPhase, opt = {}) {
     const alpha =
       (opt.alpha == null ? 1 : opt.alpha) *
@@ -965,10 +1381,7 @@
     c.translate(x, y);
     c.rotate(rot);
     c.globalAlpha = alpha;
-    if (skin.glow) {
-      c.shadowColor = skin.glow;
-      c.shadowBlur = r * 1.6;
-    } // tail
+    // tail
     c.fillStyle = skin.wing;
     c.beginPath();
     c.moveTo(-r * 0.75, -r * 0.08);
@@ -976,14 +1389,10 @@
     c.lineTo(-r * 1.5, r * 0.34);
     c.closePath();
     c.fill(); // body
-    const body = c.createLinearGradient(0, -r, 0, r);
-    body.addColorStop(0, skin.bodyLight || skin.body);
-    body.addColorStop(1, skin.body);
-    c.fillStyle = body;
+    c.fillStyle = birdBodyGradient(c, r, skin);
     c.beginPath();
     c.ellipse(0, 0, r * 1.18, r, 0, 0, TAU);
     c.fill();
-    c.shadowBlur = 0;
     c.lineWidth = Math.max(1.2, r * 0.09);
     c.strokeStyle = skin.outline;
     c.globalAlpha = alpha * 0.32;
@@ -1057,30 +1466,192 @@
     }
     c.restore();
   }
+  function buildSprites() {
+    const scale = Math.min(2, artScale());
+    // Coin ---------------------------------------------------------------
+    {
+      const S = 34,
+        C = 17;
+      const layer = resetLayer(layerCache.coin, S, S, scale);
+      const g = layer.ctx;
+      g.translate(C, C);
+      g.globalAlpha = 0.12;
+      g.fillStyle = '#ffd166';
+      g.beginPath();
+      g.arc(0, 0, 15, 0, TAU);
+      g.fill();
+      g.globalAlpha = 1;
+      const grd = g.createRadialGradient(-3, -4, 1, 0, 0, 13);
+      grd.addColorStop(0, '#fff8d2');
+      grd.addColorStop(0.45, '#ffd166');
+      grd.addColorStop(1, '#dd961f');
+      g.fillStyle = grd;
+      g.beginPath();
+      g.arc(0, 0, 12, 0, TAU);
+      g.fill();
+      g.strokeStyle = 'rgba(122,72,6,0.55)';
+      g.lineWidth = 2;
+      g.stroke();
+      g.strokeStyle = 'rgba(255,255,255,0.7)';
+      g.lineWidth = 1.4;
+      g.beginPath();
+      g.arc(0, 0, 8.4, -2.3, 0.5);
+      g.stroke();
+      g.fillStyle = 'rgba(141,86,12,0.75)';
+      starPath(g, 0, 0.5, 4.6, 2, 5);
+      g.fill();
+      layerCache.coin = layer;
+    }
+    // Shield -------------------------------------------------------------
+    {
+      const S = 76,
+        C = 38,
+        R = 29;
+      const layer = resetLayer(layerCache.shield, S, S, scale);
+      const g = layer.ctx;
+      g.translate(C, C);
+      const grd = g.createRadialGradient(-7, -8, 2, 0, 0, R);
+      grd.addColorStop(0, 'rgba(160,235,255,0.05)');
+      grd.addColorStop(0.72, 'rgba(125,211,252,0.12)');
+      grd.addColorStop(1, 'rgba(125,211,252,0.35)');
+      g.fillStyle = grd;
+      g.beginPath();
+      g.arc(0, 0, R, 0, TAU);
+      g.fill();
+      g.strokeStyle = 'rgba(190,245,255,0.85)';
+      g.lineWidth = 2;
+      g.beginPath();
+      g.arc(0, 0, R, -0.6, 1.6);
+      g.stroke();
+      g.strokeStyle = 'rgba(190,245,255,0.35)';
+      g.beginPath();
+      g.arc(0, 0, R - 4, 1.8, 4.3);
+      g.stroke();
+      g.fillStyle = 'rgba(255,255,255,0.7)';
+      g.beginPath();
+      g.arc(-R * 0.55, -R * 0.52, 2.2, 0, TAU);
+      g.fill();
+      layerCache.shield = layer;
+    }
+    // Pickups ------------------------------------------------------------
+    const power = layerCache.power || (layerCache.power = {});
+    const types = ['shield', 'slow', 'magnet'];
+    for (let ti = 0; ti < types.length; ti++) {
+      const type = types[ti];
+      const color = POWER_COLORS[type] || '#a78bfa';
+      const S = 64,
+        C = 32;
+      const layer = resetLayer(power[type], S, S, scale);
+      const g = layer.ctx;
+      g.translate(C, C);
+      const glow = g.createRadialGradient(0, 0, 3, 0, 0, 30);
+      glow.addColorStop(0, withAlpha(color, 0.4));
+      glow.addColorStop(1, withAlpha(color, 0));
+      g.fillStyle = glow;
+      g.beginPath();
+      g.arc(0, 0, 30, 0, TAU);
+      g.fill();
+      g.fillStyle = 'rgba(12,18,38,0.82)';
+      g.beginPath();
+      g.arc(0, 0, 16, 0, TAU);
+      g.fill();
+      g.strokeStyle = color;
+      g.lineWidth = 2;
+      g.stroke();
+      g.save();
+      g.strokeStyle = '#f4fbff';
+      g.fillStyle = '#f4fbff';
+      g.lineWidth = 2.2;
+      g.lineCap = 'round';
+      g.lineJoin = 'round';
+      if (type === 'shield') {
+        g.beginPath();
+        g.moveTo(0, -8);
+        g.lineTo(7, -5.5);
+        g.lineTo(6.3, 2);
+        g.quadraticCurveTo(5, 6.2, 0, 8.6);
+        g.quadraticCurveTo(-5, 6.2, -6.3, 2);
+        g.lineTo(-7, -5.5);
+        g.closePath();
+        g.fill();
+        g.strokeStyle = color;
+        g.lineWidth = 1.2;
+        g.stroke();
+      } else if (type === 'slow') {
+        g.beginPath();
+        g.arc(0, 0, 7.2, 0, TAU);
+        g.stroke();
+        g.beginPath();
+        g.moveTo(0, -4.5);
+        g.lineTo(0, 0.5);
+        g.lineTo(3.4, 2.6);
+        g.stroke();
+        g.fillStyle = color;
+        g.beginPath();
+        g.arc(0, 0, 1.7, 0, TAU);
+        g.fill();
+      } else {
+        g.lineWidth = 3.2;
+        g.beginPath();
+        g.moveTo(-6, 5.2);
+        g.lineTo(-6, -0.5);
+        g.arc(0, -0.5, 6, Math.PI, 0);
+        g.lineTo(6, 5.2);
+        g.stroke();
+        g.strokeStyle = color;
+        g.lineWidth = 3.2;
+        g.beginPath();
+        g.moveTo(-6, 5.6);
+        g.lineTo(-6, 2.4);
+        g.moveTo(6, 5.6);
+        g.lineTo(6, 2.4);
+        g.stroke();
+      }
+      g.restore();
+      power[type] = layer;
+    }
+    // Glowing skins ------------------------------------------------------
+    const glows = layerCache.glow || (layerCache.glow = {});
+    for (let i = 0; i < SKINS.length; i++) {
+      const skin = SKINS[i];
+      if (!skin.glow) continue;
+      const S = 120,
+        C = 60;
+      const layer = resetLayer(glows[skin.id], S, S, scale);
+      const g = layer.ctx;
+      g.translate(C, C);
+      const grd = g.createRadialGradient(0, 0, 4, 0, 0, 52);
+      grd.addColorStop(0, skin.glow);
+      grd.addColorStop(0.6, withAlpha(skin.accent, 0.12));
+      grd.addColorStop(1, withAlpha(skin.accent, 0));
+      g.fillStyle = grd;
+      g.beginPath();
+      g.arc(0, 0, 52, 0, TAU);
+      g.fill();
+      glows[skin.id] = layer;
+    }
+  }
+  function drawBirdGlow(skin, alpha) {
+    const glows = layerCache.glow;
+    if (!glows) return;
+    const spr = glows[skin.id];
+    if (!spr) return;
+    const b = game.bird;
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(spr.canvas, b.x - 60, b.y - 60, 120, 120);
+    ctx.globalAlpha = 1;
+  }
   function drawShield(t) {
+    const spr = layerCache.shield;
+    if (!spr) return;
     const b = game.bird;
     const r = 28 + Math.sin(t * 4) * 1.5;
-    const g = ctx.createRadialGradient(b.x - 7, b.y - 8, 2, b.x, b.y, r);
-    g.addColorStop(0, 'rgba(160,235,255,0.05)');
-    g.addColorStop(0.72, 'rgba(125,211,252,0.12)');
-    g.addColorStop(1, 'rgba(125,211,252,0.35)');
-    ctx.fillStyle = g;
-    ctx.beginPath();
-    ctx.arc(b.x, b.y, r, 0, TAU);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(190,245,255,0.85)';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(b.x, b.y, r, -0.6, 1.6);
-    ctx.stroke();
-    ctx.strokeStyle = 'rgba(190,245,255,0.35)';
-    ctx.beginPath();
-    ctx.arc(b.x, b.y, r - 4, 1.8, 4.3);
-    ctx.stroke();
-    ctx.fillStyle = 'rgba(255,255,255,0.7)';
-    ctx.beginPath();
-    ctx.arc(b.x - r * 0.55, b.y - r * 0.52, 2.2, 0, TAU);
-    ctx.fill();
+    const s = r / 29;
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.scale(s, s);
+    ctx.drawImage(spr.canvas, -38, -38, 76, 76);
+    ctx.restore();
   }
   function drawMagnetField(t) {
     const b = game.bird;
@@ -1131,6 +1702,8 @@
   }
   // ----------------------------------------------------------------- coins
   function drawCoins(t) {
+    const coin = layerCache.coin;
+    if (!coin) return;
     for (const c of game.coins) {
       if (game.magnet > 0) {
         const mdx = game.bird.x - c.x;
@@ -1152,50 +1725,27 @@
       const squash = 0.35 + 0.65 * Math.abs(Math.cos(t * 4 + c.phase));
       ctx.save();
       ctx.translate(c.x, c.y + bob);
-      ctx.globalAlpha = 0.12;
-      ctx.fillStyle = '#ffd166';
-      ctx.beginPath();
-      ctx.arc(0, 0, 15, 0, TAU);
-      ctx.fill();
-      ctx.globalAlpha = 1;
       ctx.scale(squash, 1);
-      const g = ctx.createRadialGradient(-3, -4, 1, 0, 0, 13);
-      g.addColorStop(0, '#fff8d2');
-      g.addColorStop(0.45, '#ffd166');
-      g.addColorStop(1, '#dd961f');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(0, 0, 12, 0, TAU);
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(122,72,6,0.55)';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.strokeStyle = 'rgba(255,255,255,0.7)';
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      ctx.arc(0, 0, 8.4, -2.3, 0.5);
-      ctx.stroke();
-      ctx.fillStyle = 'rgba(141,86,12,0.75)';
-      starPath(ctx, 0, 0.5, 4.6, 2, 5);
-      ctx.fill();
+      ctx.drawImage(coin.canvas, -17, -17, 34, 34);
       ctx.restore();
     }
   }
+  const powerStroke = {};
   function drawPowerups(t) {
+    const sprites = layerCache.power;
+    if (!sprites) return;
     for (const pu of game.powerups) {
+      const spr = sprites[pu.type];
+      if (!spr) continue;
       const y = pu.y + Math.sin(t * 3 + pu.phase) * 4;
       const color = POWER_COLORS[pu.type] || '#a78bfa';
+      const pulse = 0.5 + 0.5 * Math.sin(t * 4 + pu.phase);
+      const stroke =
+        powerStroke[pu.type] || (powerStroke[pu.type] = withAlpha(color, 0.55));
       ctx.save();
       ctx.translate(pu.x, y);
-      const pulse = 0.5 + 0.5 * Math.sin(t * 4 + pu.phase);
-      const glow = ctx.createRadialGradient(0, 0, 3, 0, 0, 30);
-      glow.addColorStop(0, withAlpha(color, 0.4));
-      glow.addColorStop(1, withAlpha(color, 0));
-      ctx.fillStyle = glow;
-      ctx.beginPath();
-      ctx.arc(0, 0, 30, 0, TAU);
-      ctx.fill();
-      ctx.strokeStyle = withAlpha(color, 0.55);
+      ctx.drawImage(spr.canvas, -32, -32, 64, 64);
+      ctx.strokeStyle = stroke;
       ctx.lineWidth = 1.6;
       ctx.setLineDash([4, 5]);
       ctx.lineDashOffset = -t * 16;
@@ -1203,70 +1753,12 @@
       ctx.arc(0, 0, 21 + pulse * 2, 0, TAU);
       ctx.stroke();
       ctx.setLineDash([]);
-      ctx.fillStyle = 'rgba(12,18,38,0.82)';
-      ctx.beginPath();
-      ctx.arc(0, 0, 16, 0, TAU);
-      ctx.fill();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.save();
-      ctx.strokeStyle = '#f4fbff';
-      ctx.fillStyle = '#f4fbff';
-      ctx.lineWidth = 2.2;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      if (pu.type === 'shield') {
-        ctx.beginPath();
-        ctx.moveTo(0, -8);
-        ctx.lineTo(7, -5.5);
-        ctx.lineTo(6.3, 2);
-        ctx.quadraticCurveTo(5, 6.2, 0, 8.6);
-        ctx.quadraticCurveTo(-5, 6.2, -6.3, 2);
-        ctx.lineTo(-7, -5.5);
-        ctx.closePath();
-        ctx.fill();
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.2;
-        ctx.stroke();
-      } else if (pu.type === 'slow') {
-        ctx.beginPath();
-        ctx.arc(0, 0, 7.2, 0, TAU);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(0, -4.5);
-        ctx.lineTo(0, 0.5);
-        ctx.lineTo(3.4, 2.6);
-        ctx.stroke();
-        ctx.fillStyle = color;
-        ctx.beginPath();
-        ctx.arc(0, 0, 1.7, 0, TAU);
-        ctx.fill();
-      } else {
-        // horseshoe magnet
-        ctx.lineWidth = 3.2;
-        ctx.beginPath();
-        ctx.moveTo(-6, 5.2);
-        ctx.lineTo(-6, -0.5);
-        ctx.arc(0, -0.5, 6, Math.PI, 0);
-        ctx.lineTo(6, 5.2);
-        ctx.stroke();
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 3.2;
-        ctx.beginPath();
-        ctx.moveTo(-6, 5.6);
-        ctx.lineTo(-6, 2.4);
-        ctx.moveTo(6, 5.6);
-        ctx.lineTo(6, 2.4);
-        ctx.stroke();
-      }
-      ctx.restore();
       ctx.restore();
     }
   }
   // ------------------------------------------------------------- particles
   function spawnParticle(o) {
-    if (game.particles.length > 300) return;
+    if (game.particles.length > (perf.level === 0 ? 140 : 300)) return;
     game.particles.push({
       x: o.x,
       y: o.y,
@@ -1312,12 +1804,14 @@
         ctx.beginPath();
         ctx.ellipse(0, 0, p.r * 1.6, p.r * 0.65, 0, 0, TAU);
         ctx.fill();
-        ctx.strokeStyle = 'rgba(0,0,0,0.15)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(-p.r * 1.4, 0);
-        ctx.lineTo(p.r * 1.4, 0);
-        ctx.stroke();
+        if (perf.level > 0) {
+          ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(-p.r * 1.4, 0);
+          ctx.lineTo(p.r * 1.4, 0);
+          ctx.stroke();
+        }
       } else if (p.type === 'ring') {
         ctx.strokeStyle = p.color;
         ctx.lineWidth = 2;
@@ -1337,19 +1831,41 @@
       ctx.restore();
     }
   }
+  const metricCache = new Map();
   function floaterMetrics(text, size) {
+    const key = size + '|' + text;
+    let cached = metricCache.get(key);
+    if (cached) return cached;
     ctx.save();
     ctx.font = `900 ${size}px "Segoe UI", system-ui, sans-serif`;
     const textW = ctx.measureText(text).width;
     ctx.restore();
     const iconR = size * 0.43;
     const tileR = iconR + 3.2;
-    return {
+    cached = {
       w: 7 + tileR * 2 + 7 + textW + 13,
       h: size + 14,
       iconR,
       tileR,
     };
+    metricCache.set(key, cached);
+    return cached;
+  }
+  const pillGradCache = new WeakMap();
+  function pillGradient(c, h) {
+    let map = pillGradCache.get(c);
+    if (!map) {
+      map = new Map();
+      pillGradCache.set(c, map);
+    }
+    let g = map.get(h);
+    if (!g) {
+      g = c.createLinearGradient(0, -h / 2, 0, h / 2);
+      g.addColorStop(0, 'rgba(24, 30, 54, 0.96)');
+      g.addColorStop(1, 'rgba(7, 11, 25, 0.94)');
+      map.set(h, g);
+    }
+    return g;
   }
   function addFloater(text, x, y, color, size, kind) {
     const b = game.bird;
@@ -1493,19 +2009,13 @@
       ctx.save();
       ctx.translate(f.x, f.y);
       ctx.scale(scale, scale);
-      const bg = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
-      bg.addColorStop(0, 'rgba(24, 30, 54, 0.96)');
-      bg.addColorStop(1, 'rgba(7, 11, 25, 0.94)');
-      ctx.shadowColor = withAlpha(f.color, 0.42);
-      ctx.shadowBlur = 16;
-      ctx.fillStyle = bg;
+      ctx.fillStyle = pillGradient(ctx, h);
       roundRect(ctx, -w / 2, -h / 2, w, h, h / 2);
       ctx.fill();
-      ctx.shadowBlur = 0;
       ctx.strokeStyle = withAlpha(f.color, 0.58);
       ctx.lineWidth = 1.2;
       ctx.stroke();
-      ctx.strokeStyle = withAlpha('#ffffff', 0.12);
+      ctx.strokeStyle = 'rgba(255,255,255,0.12)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(-w / 2 + h * 0.6, -h / 2 + 1);
@@ -1528,18 +2038,6 @@
   // --------------------------------------------------------------- fx layer
   function drawOverlayFx(t) {
     const { vw, vh, groundY } = view;
-    const vg = ctx.createRadialGradient(
-      vw / 2,
-      vh * 0.45,
-      Math.min(vw, vh) * 0.32,
-      vw / 2,
-      vh * 0.5,
-      Math.max(vw, vh) * 0.78,
-    );
-    vg.addColorStop(0, 'rgba(0,0,0,0)');
-    vg.addColorStop(1, 'rgba(4,7,18,0.4)');
-    ctx.fillStyle = vg;
-    ctx.fillRect(0, 0, vw, vh);
     if (game.slow > 0) {
       const a = Math.min(1, game.slow / 1.1) * 0.55;
       const left = ctx.createLinearGradient(0, 0, vw * 0.22, 0);
@@ -1552,18 +2050,20 @@
       right.addColorStop(1, 'rgba(110,80,220,0)');
       ctx.fillStyle = right;
       ctx.fillRect(vw * 0.78, 0, vw * 0.22, vh);
-      ctx.save();
-      ctx.globalAlpha = 0.22;
-      ctx.strokeStyle = '#c4b5fd';
-      ctx.lineWidth = 1.5;
-      for (let i = 0; i < 5; i++) {
-        const y = ((t * 90 + i * 160) % (groundY + 60)) - 30;
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(vw, y + 12);
-        ctx.stroke();
+      if (perf.level > 0) {
+        ctx.save();
+        ctx.globalAlpha = 0.22;
+        ctx.strokeStyle = '#c4b5fd';
+        ctx.lineWidth = 1.5;
+        for (let i = 0; i < 5; i++) {
+          const y = ((t * 90 + i * 160) % (groundY + 60)) - 30;
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(vw, y + 12);
+          ctx.stroke();
+        }
+        ctx.restore();
       }
-      ctx.restore();
     }
     if (game.closePulse > 0) {
       const a = game.closePulse * 0.25;
@@ -1585,11 +2085,8 @@
       ctx.lineWidth = 8;
       ctx.strokeRect(4, 4, vw - 8, vh - 8);
     }
-    if (game.flash > 0) {
-      ctx.fillStyle = `rgba(255,255,255,${game.flash * 0.55})`;
-      ctx.fillRect(0, 0, vw, vh);
-    }
   }
+  let tutorialTextW = 0;
   function drawTutorial(t) {
     if (game.scene !== 'playing' || game.score !== 0 || game.flaps > 0) return;
     if (game.floaters.length) return;
@@ -1602,21 +2099,21 @@
     ctx.globalAlpha = a;
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
-    ctx.font = font;
-    const tw = ctx.measureText(label).width;
+    if (!tutorialTextW) {
+      ctx.font = font;
+      tutorialTextW = ctx.measureText(label).width;
+    }
+    const tw = tutorialTextW;
     const w = tw + 52;
     const h = 34;
     const x = b.x + 6;
     const y = b.y - 76;
-    ctx.shadowColor = 'rgba(255, 209, 102, 0.2)';
-    ctx.shadowBlur = 18 + pulse * 8;
     const bg = ctx.createLinearGradient(0, y - h / 2, 0, y + h / 2);
     bg.addColorStop(0, 'rgba(23, 30, 55, 0.95)');
     bg.addColorStop(1, 'rgba(7, 11, 24, 0.93)');
     ctx.fillStyle = bg;
     roundRect(ctx, x - w / 2, y - h / 2, w, h, h / 2);
     ctx.fill();
-    ctx.shadowBlur = 0;
     ctx.strokeStyle = withAlpha('#ffd166', 0.3 + 0.14 * pulse);
     ctx.lineWidth = 1.2;
     ctx.stroke();
@@ -1681,7 +2178,8 @@
   // ----------------------------------------------------------------- render
   function render(t) {
     const p = paletteNow();
-    const s = view.dpr * view.scale;
+    flushArt();
+    const s = view.rs * view.scale;
     ctx.setTransform(s, 0, 0, s, 0, 0);
     drawSky(p);
     ctx.save();
@@ -1704,6 +2202,7 @@
       const skin = skinById(save.skin);
       const flicker = game.invuln > 0 ? 0.55 + 0.45 * Math.sin(t * 42) : 1;
       drawComboAura(t);
+      if (skin.glow) drawBirdGlow(skin, flicker * 0.85);
       drawBirdShape(ctx, b.x, b.y, 15, b.rot, skin, b.wing, {
         blink: b.blink < 0.12,
         alpha: flicker,
@@ -1867,7 +2366,7 @@
     game.shield = 0;
     game.invuln = 1.4;
     game.shake = shakeOn() ? 13 : 0;
-    game.flash = shakeOn() ? 0.4 : 0.15;
+    fireFlash();
     if (kind === 'ground') {
       b.y = Math.min(b.y, view.groundY - 46);
       b.vy = -360;
@@ -1915,7 +2414,7 @@
     b.vy = kind === 'ground' ? -300 : -340;
     b.wingSpeed = 22;
     game.shake = shakeOn() ? 17 : 0;
-    game.flash = shakeOn() ? 0.8 : 0.2;
+    fireFlash();
     Sound.hit();
     Sound.die();
     burstFeathers();
@@ -2362,7 +2861,6 @@
     game.time += dt;
     if (game.scene === 'paused') return;
     game.day = (game.day + dt * 0.012) % 4;
-    if (game.flash > 0) game.flash = Math.max(0, game.flash - dt * 2.4);
     if (game.shake > 0) game.shake = Math.max(0, game.shake - dt * 24);
     if (game.closePulse > 0)
       game.closePulse = Math.max(0, game.closePulse - dt * 2.4);
@@ -2409,6 +2907,13 @@
     }
   }
   // -------------------------------------------------------------------- UI
+  function fireFlash() {
+    const node = el.flash;
+    if (!node) return;
+    node.classList.remove('fire');
+    void node.offsetWidth;
+    node.classList.add('fire');
+  }
   function shakeOn() {
     return !REDUCED && save.shake !== false;
   }
@@ -2773,7 +3278,6 @@
     game.magnet = 0;
     game.closePulse = 0;
     game.invuln = 0;
-    game.flash = 0;
     game.shake = 0;
     game.bird.y = view.vh * 0.42;
     game.bird.vy = 0;
@@ -2809,7 +3313,6 @@
     game.closePulse = 0;
     game.invuln = 0;
     game.shake = 0;
-    game.flash = 0;
     game.hitstop = 0;
     game.deathTimer = 0;
     game.deathHandled = false;
@@ -3214,7 +3717,10 @@
     });
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     window.addEventListener('keydown', onKey);
-    window.addEventListener('resize', () => {
+    // Resizing rebuilds every cached layer, so coalesce the burst of resize
+    // events a drag or orientation change produces.
+    let resizeTimer = 0;
+    function handleResize() {
       resize();
       if (game.scene === 'playing' || game.scene === 'paused') {
         game.pipes.forEach((p) => {
@@ -3226,11 +3732,18 @@
         game.bird.y = clamp(game.bird.y, 30, view.groundY - 30);
       }
       updateHud(true);
+    }
+    window.addEventListener('resize', () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(handleResize, 90);
     });
     window.addEventListener('orientationchange', () =>
       setTimeout(() => {
-        resize();
-        updateHud(true);
+        if (resizeTimer) {
+          clearTimeout(resizeTimer);
+          resizeTimer = 0;
+        }
+        handleResize();
       }, 120),
     );
     document.addEventListener('visibilitychange', () => {
@@ -3243,19 +3756,37 @@
   }
   // ------------------------------------------------------------------- loop
   let lastFrame = performance.now();
+  let lastRender = 0;
   let accumulator = 0;
+  const IDLE_RENDER_MS = 34; // menu panels cover most of the canvas
   function frame(now) {
-    const raw = Math.min(0.1, (now - lastFrame) / 1000);
+    const elapsed = (now - lastFrame) / 1000;
+    const raw = Math.min(0.1, elapsed);
     lastFrame = now;
     accumulator += raw;
+    // Cap catch-up work so a slow device cannot spiral into a longer frame.
     let guard = 0;
-    while (accumulator >= STEP && guard < 14) {
+    while (accumulator >= STEP && guard < 6) {
       accumulator -= STEP;
       tick(STEP);
       guard++;
     }
-    if (guard >= 14) accumulator = 0;
-    render(now / 1000);
+    if (guard >= 6) accumulator = 0;
+    const scene = game.scene;
+    const idle =
+      scene === 'shop' || scene === 'goals' || scene === 'settings';
+    const draw = !idle || now - lastRender >= IDLE_RENDER_MS;
+    artBuilt = 0;
+    let work = 0;
+    if (draw) {
+      const start = performance.now();
+      lastRender = now;
+      render(now / 1000);
+      work = performance.now() - start;
+    }
+    // Frames that rasterise a cached layer carry a one-off cost and would
+    // otherwise drag the resolution down. Hidden tabs are not representative.
+    if (draw && !artBuilt && !document.hidden) sampleFrame(work);
     requestAnimationFrame(frame);
   }
   function init() {

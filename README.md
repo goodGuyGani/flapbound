@@ -26,6 +26,7 @@ Live: [goodguygani.github.io/flapbound](https://goodguygani.github.io/flapbound/
 - **Coins, medals, and bests** - per-mode best, all-time best, run count, skins, goals, and stats all save locally in `localStorage`.
 - **Synthesized audio** - sound effects and the generative music loop are made with the Web Audio API. Music gains a sparkle layer while a perfect streak is alive. Audio starts after your first tap or key press.
 - **Hand-drawn canvas world** - parallax clouds, hills, birds, a day/night palette cycle, particles, screen shake, and confetti.
+- **Smooth on phones and older laptops** - static scenery is pre-rendered into cached layers, and the canvas resolution adapts to the device's pixel budget and measured frame cost, stepping down automatically when a device struggles and back up when it recovers.
 - **Responsive and accessible** - fills phones and desktops, honors reduced-motion preferences, includes a how-to-play section, and supports keyboard play.
 
 ## Files
